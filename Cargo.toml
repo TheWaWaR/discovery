@@ -2,6 +2,7 @@
 name = "discovery"
 version = "0.1.0"
 authors = ["Linfeng Qian <thewawar@gmail.com>"]
+edition = "2018"
 
 [dependencies]
 yamux = { git = "https://github.com/TheWaWaR/yamux" }
