@@ -5,7 +5,6 @@ use std::net::{SocketAddr, IpAddr};
 use std::collections::{BTreeMap, VecDeque};
 
 use yamux::{
-    StreamId,
     config::Config,
     session::Session,
     stream::StreamHandle,
@@ -231,8 +230,7 @@ impl Stream for Discovery {
             }
 
             match value.send_messages() {
-                Ok(Async::Ready(())) => {},
-                Ok(Async::NotReady) => {},
+                Ok(_) => {},
                 Err(err) => {
                     debug!("substream {:?} send messages error: {:?}", key, err);
                     // remove the substream
@@ -241,12 +239,11 @@ impl Stream for Discovery {
             }
 
             match value.receive_messages() {
-                Ok(Async::Ready(nodes_list)) => {
+                Ok(nodes_list) => {
                     for nodes in nodes_list {
                         self.pending_nodes.push_back(nodes);
                     }
                 },
-                Ok(Async::NotReady) => {},
                 Err(err) => {
                     debug!("substream {:?} receive messages error: {:?}", key, err);
                     // remove the substream
@@ -277,21 +274,42 @@ pub struct SubstreamValue {
 }
 
 impl SubstreamValue {
-    fn send_messages(&mut self) -> Poll<(), io::Error> {
+    fn send_messages(&mut self) -> Result<(), io::Error> {
         while let Some(message) = self.pending_messages.pop_front() {
             match self.framed_stream.start_send(message)? {
                 AsyncSink::NotReady(message) => {
                     self.pending_messages.push_front(message);
-                    return Ok(Async::NotReady);
+                    return Ok(());
                 }
                 AsyncSink::Ready => {},
             }
         }
-        self.framed_stream.poll_complete()
+        self.framed_stream.poll_complete()?;
+        Ok(())
     }
 
-    fn receive_messages(&mut self) -> Poll<Vec<Nodes>, io::Error> {
-        Ok(Async::NotReady)
+    fn handle_message(&mut self, message: DiscoveryMessage) -> Result<Option<Nodes>, io::Error> {
+        Ok(None)
+    }
+
+    fn receive_messages(&mut self) -> Result<Vec<Nodes>, io::Error> {
+        let mut nodes_list = Vec::new();
+        loop {
+            match self.framed_stream.poll()? {
+                Async::Ready(Some(message)) => {
+                    if let Some(nodes) = self.handle_message(message)? {
+                        nodes_list.push(nodes);
+                    }
+                },
+                Async::Ready(None) => {
+                    debug!("remote closed");
+                },
+                Async::NotReady => {
+                    break;
+                },
+            }
+        }
+        Ok(nodes_list)
     }
 }
 
