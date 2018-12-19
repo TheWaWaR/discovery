@@ -1,4 +1,8 @@
 use std::io;
+use std::rc::Rc;
+use std::time::{Instant, Duration};
+use std::net::{SocketAddr, IpAddr};
+use std::collections::{BTreeMap, VecDeque};
 
 use yamux::{
     StreamId,
@@ -6,7 +10,7 @@ use yamux::{
     session::Session,
     stream::StreamHandle,
 };
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use futures::{
     try_ready,
     Async,
@@ -16,28 +20,114 @@ use futures::{
     Stream,
     sync::mpsc::{channel, Sender, Receiver},
 };
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_codec::{Framed};
+use tokio_codec::{Framed, Decoder, Encoder};
+use tokio_timer::{self, Interval};
 use multiaddr::{Multiaddr};
+use log::debug;
+use bincode::{serialize, deserialize};
+use serde_derive::{Serialize, Deserialize};
 
-pub trait AddressManager {
-    // Add to known address list
-    fn add_known(&mut self);
-    // Add new addresses
-    fn add_new(&mut self);
-    // Remember feleer connection
-    fn add_tried(&mut self);
-    // Get addresses for startup connections
-    fn get_addresses(&self, max: usize);
-    // When connected connection is not enough,
-    // get some random addresses to connnect to.
-    fn get_random(&self, n: usize);
+
+// See: bitcoin/netaddress.cpp pchIPv4[12]
+const PCH_IPV4: [u8; 18] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
+    // ipv4 part
+    0, 0, 0, 0,
+    // port part
+    0, 0
+];
+const DEFAULT_MAX_KNOWN: usize = 5000;
+// FIXME: should be a global version number
+const VERSION: u32 = 0;
+// The maximum number of new addresses to accumulate before announcing.
+const MAX_ADDR_TO_SEND: u32 = 1000;
+
+
+#[derive(Clone, Debug, PartialOrd, Ord, Eq, PartialEq, Hash, Serialize, Deserialize)]
+struct AddrRaw([u8; 18]);
+
+impl From<SocketAddr> for AddrRaw {
+    // CService::GetKey()
+    fn from(addr: SocketAddr) -> AddrRaw {
+        let mut data = PCH_IPV4;
+        match addr.ip() {
+            IpAddr::V4(ipv4) => {
+                data[12..16].copy_from_slice(&ipv4.octets());
+            }
+            IpAddr::V6(ipv6) => {
+                data[0..16].copy_from_slice(&ipv6.octets());
+            }
+        }
+        let port = addr.port();
+        data[16] = (port / 0x100) as u8;
+        data[17] = (port & 0x0FF) as u8;
+        AddrRaw(data)
+    }
 }
 
 
+// bitcoin: bloom.h, bloom.cpp => CRollingBloomFilter
+pub struct AddrKnown {
+    max_known: usize,
+    addrs: FnvHashSet<AddrRaw>,
+    addr_times: FnvHashMap<AddrRaw, Instant>,
+    time_addrs: BTreeMap<Instant, AddrRaw>,
+}
+
+impl AddrKnown {
+    fn new(max_known: usize) -> AddrKnown {
+        AddrKnown {
+            max_known,
+            addrs: FnvHashSet::default(),
+            addr_times: FnvHashMap::default(),
+            time_addrs: BTreeMap::default(),
+        }
+    }
+
+    fn insert(&mut self, addr: SocketAddr) {
+        let key = AddrRaw::from(addr);
+        let now = Instant::now();
+        self.addrs.insert(key.clone());
+        self.time_addrs.insert(now.clone(), key.clone());
+        self.addr_times.insert(key, now);
+
+        if self.addrs.len() > self.max_known {
+            let first_time = {
+                let (first_time, first_key) = self.time_addrs.iter().next().unwrap();
+                self.addrs.remove(&first_key);
+                self.addr_times.remove(&first_key);
+                first_time.clone()
+            };
+            self.time_addrs.remove(&first_time);
+        }
+    }
+
+    fn contains(&self, addr: SocketAddr) -> bool {
+        self.addrs.contains(&AddrRaw::from(addr))
+    }
+
+    fn reset(&mut self) {
+        self.addrs.clear();
+        self.time_addrs.clear();
+        self.addr_times.clear();
+    }
+}
+
+impl Default for AddrKnown {
+    fn default() -> AddrKnown {
+        AddrKnown::new(DEFAULT_MAX_KNOWN)
+    }
+}
+
 pub struct Discovery {
+    // Default: 5000
+    max_known: usize,
+    addr_knowns: FnvHashMap<SocketAddr, AddrKnown>,
+
     // For manage those substreams
-    substreams: FnvHashMap<SubstreamKey, Substream>,
+    substreams: FnvHashMap<SubstreamKey, SubstreamValue>,
 
     // For add new substream to Discovery
     substream_sender: Sender<Substream>,
@@ -45,18 +135,34 @@ pub struct Discovery {
     substream_receiver: Receiver<Substream>,
 }
 
+pub struct DiscoveryHandle {
+    pub substream_sender: Sender<Substream>,
+}
+
 impl Discovery {
-    pub fn new() -> Discovery {
+    pub fn new(max_known: usize) -> Discovery {
         let (substream_sender, substream_receiver) = channel(8);
         Discovery {
+            max_known,
+            addr_knowns: FnvHashMap::default(),
             substreams: FnvHashMap::default(),
             substream_sender,
             substream_receiver,
         }
     }
-    fn bootstrap() {}
-    fn query_dns() {}
-    fn get_builtin_addresses() {}
+
+    pub fn handle(&self) -> DiscoveryHandle {
+        DiscoveryHandle {
+            substream_sender: self.substream_sender.clone()
+        }
+    }
+
+    // fn bootstrap() {}
+    // fn query_dns() {}
+    // fn get_builtin_addresses() {}
+
+    fn get_nodes(&mut self) {}
+    fn handle_nodes(&mut self) {}
 }
 
 impl Stream for Discovery {
@@ -64,24 +170,162 @@ impl Stream for Discovery {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.substream_receiver.poll() {
+            Err(err) => {
+                debug!("receive substream error: {:?}", err);
+                return Err(io::ErrorKind::Other.into());
+            },
+            Ok(Async::Ready(Some(substream))) => {
+                let key = substream.key();
+                let framed_stream = Framed::new(substream.stream, DiscoveryCodec::default());
+                let timer_future = Interval::new_interval(Duration::from_secs(3600 * 24));
+                let mut pending_messages = VecDeque::default();
+                pending_messages.push_back(DiscoveryMessage::GetNodes {
+                    version: VERSION,
+                    count: MAX_ADDR_TO_SEND,
+                });
+                let value = SubstreamValue { framed_stream, timer_future, pending_messages };
+                self.substreams.insert(key, value);
+            }
+            Ok(Async::Ready(None)) => {
+                // TODO: should never happen?
+            }
+            Ok(Async::NotReady) => {}
+        }
+
+        let mut not_ready = false;
+        let mut err_keys = FnvHashSet::default();
+        let announce_message = DiscoveryMessage::Nodes(Nodes {
+            announce: true,
+            items: self.substreams
+                .keys()
+                .filter(|key| {
+                    // FIXME: filter out with known address list
+                    true
+                })
+                .map(|key| {
+                    let address = AddrRaw::from(key.remote_addr);
+                    Node { node_id: None, addresses: vec![address] }
+                })
+                .collect()
+        });
+
+        for (key, value) in self.substreams.iter_mut() {
+            match value.timer_future.poll() {
+                Ok(Async::Ready(Some(announce_at))) => {
+                    // announce Nodes
+                    value.pending_messages.push_back(announce_message.clone());
+                }
+                Ok(Async::Ready(None)) => unreachable!(),
+                Ok(Async::NotReady) => {
+                    not_ready = true;
+                }
+                Err(err) => {
+                    err_keys.insert(key.clone());
+                    continue;
+                }
+            }
+
+            match value.send_messages() {
+                Ok(Async::Ready(())) => {},
+                Ok(Async::NotReady) => {
+                    not_ready = true;
+                },
+                Err(err) => {
+                    debug!("substream {:?} send messages error: {:?}", key, err);
+                    // remove the substream
+                    err_keys.insert(key.clone());
+                    continue;
+                }
+            }
+
+            match value.receive_messages() {
+                Ok(Async::Ready(())) => {},
+                Ok(Async::NotReady) => {
+                    not_ready = true;
+                },
+                Err(err) => {
+                    debug!("substream {:?} receive messages error: {:?}", key, err);
+                    // remove the substream
+                    err_keys.insert(key.clone());
+                    continue;
+                }
+            }
+        }
         Ok(Async::NotReady)
     }
 }
 
-#[derive(Eq, PartialEq, Hash, Debug)]
+#[derive(Eq, PartialEq, Hash, Debug, Clone)]
 pub struct SubstreamKey {
-    session_id: u64,
-    substream_id: u32,
+    remote_addr: SocketAddr,
     direction: Direction,
+    substream_id: u32,
+}
+
+pub struct SubstreamValue {
+    framed_stream: Framed<StreamHandle, DiscoveryCodec>,
+    pending_messages: VecDeque<DiscoveryMessage>,
+    timer_future: Interval,
+}
+
+impl SubstreamValue {
+    fn send_messages(&mut self) -> Poll<(), io::Error> {
+        while let Some(message) = self.pending_messages.pop_front() {
+            match self.framed_stream.start_send(message)? {
+                AsyncSink::NotReady(message) => {
+                    self.pending_messages.push_front(message);
+                    return Ok(Async::NotReady);
+                }
+                AsyncSink::Ready => {},
+            }
+        }
+        self.framed_stream.poll_complete()
+    }
+
+    fn receive_messages(&mut self) -> Poll<(), io::Error> {
+        Ok(Async::NotReady)
+    }
 }
 
 pub struct Substream {
-    session_id: u64,
+    remote_addr: SocketAddr,
     direction: Direction,
     stream: StreamHandle,
 }
 
-#[derive(Eq, PartialEq, Hash, Debug)]
+impl Substream {
+    pub fn key(&self) -> SubstreamKey {
+        SubstreamKey {
+            remote_addr: self.remote_addr,
+            direction: self.direction,
+            substream_id: self.stream.id(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DiscoveryCodec {}
+
+impl Decoder for DiscoveryCodec {
+    type Item = DiscoveryMessage;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        Ok(None)
+    }
+}
+
+impl Encoder for DiscoveryCodec {
+    type Item = DiscoveryMessage;
+    type Error = io::Error;
+
+    fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
 pub enum Direction {
     // The connection(session) is open by other peer
     Inbound,
@@ -89,6 +333,7 @@ pub enum Direction {
     Outbound,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum DiscoveryMessage {
     GetNodes {
         version: u32,
@@ -97,13 +342,15 @@ pub enum DiscoveryMessage {
     Nodes(Nodes),
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct Nodes {
     announce: bool,
     items: Vec<Node>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct Node {
-    // The addresses from DNS and seed don't have `node_id`
+    // The address from DNS and seed don't have `node_id`
     node_id: Option<String>,
-    addresses: Vec<Multiaddr>,
+    addresses: Vec<AddrRaw>,
 }
