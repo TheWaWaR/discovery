@@ -43,6 +43,8 @@ const DEFAULT_MAX_KNOWN: usize = 5000;
 const VERSION: u32 = 0;
 // The maximum number of new addresses to accumulate before announcing.
 const MAX_ADDR_TO_SEND: u32 = 1000;
+// Every 24 hours send announce nodes message
+const ANNOUNCE_INTERVAL: u64 = 3600 * 24;
 
 
 #[derive(Clone, Debug, PartialOrd, Ord, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -86,8 +88,7 @@ impl AddrKnown {
         }
     }
 
-    fn insert(&mut self, addr: SocketAddr) {
-        let key = AddrRaw::from(addr);
+    fn insert(&mut self, key: AddrRaw) {
         let now = Instant::now();
         self.addrs.insert(key.clone());
         self.time_addrs.insert(now.clone(), key.clone());
@@ -104,8 +105,8 @@ impl AddrKnown {
         }
     }
 
-    fn contains(&self, addr: SocketAddr) -> bool {
-        self.addrs.contains(&AddrRaw::from(addr))
+    fn contains(&self, addr: &AddrRaw) -> bool {
+        self.addrs.contains(addr)
     }
 
     fn reset(&mut self) {
@@ -124,7 +125,9 @@ impl Default for AddrKnown {
 pub struct Discovery {
     // Default: 5000
     max_known: usize,
-    addr_knowns: FnvHashMap<SocketAddr, AddrKnown>,
+
+    // The Nodes not yet been yield
+    pending_nodes: VecDeque<Nodes>,
 
     // For manage those substreams
     substreams: FnvHashMap<SubstreamKey, SubstreamValue>,
@@ -144,7 +147,7 @@ impl Discovery {
         let (substream_sender, substream_receiver) = channel(8);
         Discovery {
             max_known,
-            addr_knowns: FnvHashMap::default(),
+            pending_nodes: VecDeque::default(),
             substreams: FnvHashMap::default(),
             substream_sender,
             substream_receiver,
@@ -171,88 +174,91 @@ impl Stream for Discovery {
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         match self.substream_receiver.poll() {
-            Err(err) => {
-                debug!("receive substream error: {:?}", err);
-                return Err(io::ErrorKind::Other.into());
-            },
             Ok(Async::Ready(Some(substream))) => {
                 let key = substream.key();
-                let framed_stream = Framed::new(substream.stream, DiscoveryCodec::default());
-                let timer_future = Interval::new_interval(Duration::from_secs(3600 * 24));
                 let mut pending_messages = VecDeque::default();
                 pending_messages.push_back(DiscoveryMessage::GetNodes {
                     version: VERSION,
                     count: MAX_ADDR_TO_SEND,
                 });
-                let value = SubstreamValue { framed_stream, timer_future, pending_messages };
+                let value = SubstreamValue {
+                    framed_stream: Framed::new(substream.stream, DiscoveryCodec::default()),
+                    timer_future: Interval::new_interval(Duration::from_secs(ANNOUNCE_INTERVAL)),
+                    pending_messages,
+                    addr_known: AddrKnown::new(self.max_known),
+                };
                 self.substreams.insert(key, value);
             }
-            Ok(Async::Ready(None)) => {
-                // TODO: should never happen?
-            }
+            Ok(Async::Ready(None)) => unreachable!(),
             Ok(Async::NotReady) => {}
+            Err(err) => {
+                debug!("receive substream error: {:?}", err);
+                return Err(io::ErrorKind::Other.into());
+            },
         }
 
-        let mut not_ready = false;
         let mut err_keys = FnvHashSet::default();
-        let announce_message = DiscoveryMessage::Nodes(Nodes {
-            announce: true,
-            items: self.substreams
-                .keys()
-                .filter(|key| {
-                    // FIXME: filter out with known address list
-                    true
-                })
-                .map(|key| {
-                    let address = AddrRaw::from(key.remote_addr);
-                    Node { node_id: None, addresses: vec![address] }
-                })
-                .collect()
-        });
+        // TODO: should optmize later
+        let addrs = self.substreams
+            .keys()
+            .filter(|key| {
+                // FIXME: filter out with known address list
+                true
+            })
+            .map(|key| AddrRaw::from(key.remote_addr))
+            .collect::<Vec<_>>();
 
         for (key, value) in self.substreams.iter_mut() {
             match value.timer_future.poll() {
                 Ok(Async::Ready(Some(announce_at))) => {
                     // announce Nodes
-                    value.pending_messages.push_back(announce_message.clone());
+                    let message = DiscoveryMessage::Nodes(Nodes {
+                        announce: true,
+                        items: addrs
+                            .iter()
+                            .filter(|addr| !value.addr_known.contains(addr))
+                            .map(|addr| Node { node_id: None, addresses: vec![addr.clone()] })
+                            .collect()
+                    });
+                    value.pending_messages.push_back(message);
                 }
                 Ok(Async::Ready(None)) => unreachable!(),
-                Ok(Async::NotReady) => {
-                    not_ready = true;
-                }
+                Ok(Async::NotReady) => {}
                 Err(err) => {
+                    debug!("substream {:?} poll timer_future error: {:?}", key, err);
                     err_keys.insert(key.clone());
-                    continue;
                 }
             }
 
             match value.send_messages() {
                 Ok(Async::Ready(())) => {},
-                Ok(Async::NotReady) => {
-                    not_ready = true;
-                },
+                Ok(Async::NotReady) => {},
                 Err(err) => {
                     debug!("substream {:?} send messages error: {:?}", key, err);
                     // remove the substream
                     err_keys.insert(key.clone());
-                    continue;
                 }
             }
 
             match value.receive_messages() {
-                Ok(Async::Ready(())) => {},
-                Ok(Async::NotReady) => {
-                    not_ready = true;
+                Ok(Async::Ready(nodes_list)) => {
+                    for nodes in nodes_list {
+                        self.pending_nodes.push_back(nodes);
+                    }
                 },
+                Ok(Async::NotReady) => {},
                 Err(err) => {
                     debug!("substream {:?} receive messages error: {:?}", key, err);
                     // remove the substream
                     err_keys.insert(key.clone());
-                    continue;
                 }
             }
         }
-        Ok(Async::NotReady)
+
+        match self.pending_nodes.pop_front() {
+            Some(nodes) => Ok(Async::Ready(Some(nodes))),
+            None => Ok(Async::NotReady)
+        }
     }
 }
 
@@ -266,6 +272,7 @@ pub struct SubstreamKey {
 pub struct SubstreamValue {
     framed_stream: Framed<StreamHandle, DiscoveryCodec>,
     pending_messages: VecDeque<DiscoveryMessage>,
+    addr_known: AddrKnown,
     timer_future: Interval,
 }
 
@@ -283,7 +290,7 @@ impl SubstreamValue {
         self.framed_stream.poll_complete()
     }
 
-    fn receive_messages(&mut self) -> Poll<(), io::Error> {
+    fn receive_messages(&mut self) -> Poll<Vec<Nodes>, io::Error> {
         Ok(Async::NotReady)
     }
 }
