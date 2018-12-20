@@ -233,6 +233,12 @@ impl Discovery {
     fn handle_nodes(&mut self) {}
 }
 
+impl Default for Discovery {
+    fn default() -> Discovery {
+        Discovery::new(DEFAULT_MAX_KNOWN)
+    }
+}
+
 impl Stream for Discovery {
     type Item = Nodes;
     type Error = io::Error;
