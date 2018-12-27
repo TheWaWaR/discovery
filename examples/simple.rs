@@ -8,9 +8,9 @@ use futures::{
 use log::debug;
 use multiaddr::Multiaddr;
 use serde_derive::{Deserialize, Serialize};
-use tokio_codec::{Decoder, Encoder, Framed};
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_timer::{self, Interval};
+use tokio::codec::{Decoder, Encoder, Framed};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::timer::{self, Interval};
 
 use discovery::{Discovery, DiscoveryHandle};
 
