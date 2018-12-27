@@ -1,42 +1,30 @@
-use std::io;
-use std::rc::Rc;
-use std::time::{Instant, Duration};
-use std::net::{SocketAddr, IpAddr};
 use std::collections::{BTreeMap, VecDeque};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use yamux::{
-    config::Config,
-    session::Session,
-    stream::StreamHandle,
-};
+use bincode::{deserialize, serialize};
+use bytes::{BufMut, Bytes, BytesMut};
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::{
-    try_ready,
-    Async,
-    AsyncSink,
-    Poll,
-    Sink,
-    Stream,
-    sync::mpsc::{channel, Sender, Receiver},
+    sync::mpsc::{channel, Receiver, Sender},
+    try_ready, Async, AsyncSink, Poll, Sink, Stream,
 };
-use bytes::{BufMut, Bytes, BytesMut};
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_codec::{Framed, Decoder, Encoder};
-use tokio_timer::{self, Interval};
-use multiaddr::{Multiaddr};
 use log::debug;
-use bincode::{serialize, deserialize};
+use multiaddr::Multiaddr;
 use rand::seq::SliceRandom;
-use serde_derive::{Serialize, Deserialize};
-
+use serde_derive::{Deserialize, Serialize};
+use tokio_codec::{Decoder, Encoder, Framed};
+use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_timer::{self, Interval};
+use yamux::{config::Config, session::Session, stream::StreamHandle};
 
 // See: bitcoin/netaddress.cpp pchIPv4[12]
 const PCH_IPV4: [u8; 18] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
-    // ipv4 part
-    0, 0, 0, 0,
-    // port part
-    0, 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, // ipv4 part
+    0, 0, 0, 0, // port part
+    0, 0,
 ];
 const DEFAULT_MAX_KNOWN: usize = 5000;
 // FIXME: should be a more high level version number
@@ -46,7 +34,6 @@ const MAX_ADDR_TO_SEND: usize = 1000;
 // Every 24 hours send announce nodes message
 const ANNOUNCE_INTERVAL: u64 = 3600 * 24;
 const ANNOUNCE_THRESHOLD: usize = 10;
-
 
 pub struct Discovery<M> {
     // Default: 5000
@@ -89,7 +76,7 @@ impl<M: AddressManager> Discovery<M> {
 
     pub fn handle(&self) -> DiscoveryHandle {
         DiscoveryHandle {
-            substream_sender: self.substream_sender.clone()
+            substream_sender: self.substream_sender.clone(),
         }
     }
 
@@ -101,26 +88,150 @@ impl<M: AddressManager> Discovery<M> {
     fn handle_nodes(&mut self) {}
 }
 
+impl<M: AddressManager> Stream for Discovery<M> {
+    type Item = Nodes;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.substream_receiver.poll() {
+            Ok(Async::Ready(Some(substream))) => {
+                let key = substream.key();
+                let value = SubstreamValue::new(
+                    key.direction,
+                    substream.stream,
+                    self.max_known,
+                    key.remote_addr,
+                );
+                self.substreams.insert(key, value);
+            }
+            Ok(Async::Ready(None)) => unreachable!(),
+            Ok(Async::NotReady) => {}
+            Err(err) => {
+                debug!("receive substream error: {:?}", err);
+                return Err(io::ErrorKind::Other.into());
+            }
+        }
+
+        // TODO: should optmize later
+        let addrs = self
+            .substreams
+            .keys()
+            .filter(|key| {
+                // FIXME: filter out with known address list
+                true
+            })
+            .map(|key| AddrRaw::from(key.remote_addr))
+            .collect::<Vec<_>>();
+
+        let mut announce_addrs = Vec::new();
+        for (key, value) in self.substreams.iter_mut() {
+            if let Err(err) = value.check_timer(&addrs) {
+                debug!("substream {:?} poll timer_future error: {:?}", key, err);
+                self.err_keys.insert(key.clone());
+            }
+
+            match value.receive_messages(&mut self.addr_mgr) {
+                Ok(Some(nodes_list)) => {
+                    for nodes in nodes_list {
+                        self.pending_nodes.push_back((key.clone(), nodes));
+                    }
+                }
+                Ok(None) => {
+                    // TODO: EOF => remote closed the connection
+                }
+                Err(err) => {
+                    debug!("substream {:?} receive messages error: {:?}", key, err);
+                    // remove the substream
+                    self.err_keys.insert(key.clone());
+                }
+            }
+
+            match value.send_messages() {
+                Ok(_) => {}
+                Err(err) => {
+                    debug!("substream {:?} send messages error: {:?}", key, err);
+                    // remove the substream
+                    self.err_keys.insert(key.clone());
+                }
+            }
+
+            if value.announce {
+                announce_addrs.push(value.remote_addr);
+            }
+        }
+
+        for key in self.err_keys.drain() {
+            self.substreams.remove(&key);
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut remain_keys = self.substreams.keys().cloned().collect::<Vec<_>>();
+        for announce_addr in announce_addrs.into_iter() {
+            remain_keys.shuffle(&mut rng);
+            for i in 0..2 {
+                if let Some(key) = remain_keys.get(i) {
+                    if let Some(value) = self.substreams.get_mut(key) {
+                        if value.announce_addrs.len() < 10 {
+                            value.announce_addrs.push(announce_addr);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (key, value) in self.substreams.iter_mut() {
+            let announce_addrs = value.announce_addrs.split_off(0);
+            if !announce_addrs.is_empty() {
+                let items = announce_addrs
+                    .into_iter()
+                    .map(|addr| Node {
+                        node_id: None,
+                        addresses: vec![AddrRaw::from(addr)],
+                    })
+                    .collect::<Vec<_>>();
+                let nodes = Nodes {
+                    announce: false,
+                    items,
+                };
+                value
+                    .pending_messages
+                    .push_back(DiscoveryMessage::Nodes(nodes));
+            }
+
+            match value.send_messages() {
+                Ok(_) => {}
+                Err(err) => {
+                    debug!("substream {:?} send messages error: {:?}", key, err);
+                    // remove the substream
+                    self.err_keys.insert(key.clone());
+                }
+            }
+        }
+
+        match self.pending_nodes.pop_front() {
+            Some((_key, nodes)) => Ok(Async::Ready(Some(nodes))),
+            None => Ok(Async::NotReady),
+        }
+    }
+}
+
 pub trait AddressManager {
     fn add_new(&mut self, addr: SocketAddr);
-    fn misbehave(&mut self, addr: SocketAddr);
+    fn misbehave(&mut self, addr: SocketAddr, ty: u64);
     fn get_random(&mut self, n: usize) -> Vec<SocketAddr>;
 }
 
 struct DemoAddressManager {}
 
 impl AddressManager for DemoAddressManager {
-    fn add_new(&mut self, addr: SocketAddr) {
-    }
+    fn add_new(&mut self, addr: SocketAddr) {}
 
-    fn misbehave(&mut self, addr: SocketAddr) {
-    }
+    fn misbehave(&mut self, addr: SocketAddr, ty: u64) {}
 
     fn get_random(&mut self, n: usize) -> Vec<SocketAddr> {
         Vec::new()
     }
 }
-
 
 #[derive(Clone, Debug, PartialOrd, Ord, Eq, PartialEq, Hash, Serialize, Deserialize)]
 struct AddrRaw([u8; 18]);
@@ -170,8 +281,12 @@ impl AddrRaw {
     pub fn is_reachable(&self) -> bool {
         match self.socket_addr().ip() {
             IpAddr::V4(ipv4) => {
-                !ipv4.is_private() && !ipv4.is_loopback() && !ipv4.is_link_local() &&
-                    !ipv4.is_broadcast() && !ipv4.is_documentation() && !ipv4.is_unspecified()
+                !ipv4.is_private()
+                    && !ipv4.is_loopback()
+                    && !ipv4.is_link_local()
+                    && !ipv4.is_broadcast()
+                    && !ipv4.is_documentation()
+                    && !ipv4.is_unspecified()
             }
             IpAddr::V6(ipv6) => {
                 let scope = if ipv6.is_multicast() {
@@ -183,7 +298,7 @@ impl AddrRaw {
                         5 => Some(false),
                         8 => Some(false),
                         14 => Some(true),
-                        _ => None
+                        _ => None,
                     }
                 } else {
                     None
@@ -202,8 +317,8 @@ impl AddrRaw {
                             && !ipv6.is_unspecified()
                         // && !ipv6.is_documentation()
                             && !((ipv6.segments()[0] == 0x2001) && (ipv6.segments()[1] == 0xdb8))
-                    },
-                    _ => false
+                    }
+                    _ => false,
                 }
             }
         }
@@ -262,121 +377,6 @@ impl Default for AddrKnown {
     }
 }
 
-impl<M: AddressManager> Stream for Discovery<M> {
-    type Item = Nodes;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        match self.substream_receiver.poll() {
-            Ok(Async::Ready(Some(substream))) => {
-                let key = substream.key();
-                let value = SubstreamValue::new(key.direction, substream.stream, self.max_known, key.remote_addr);
-                self.substreams.insert(key, value);
-            }
-            Ok(Async::Ready(None)) => unreachable!(),
-            Ok(Async::NotReady) => {}
-            Err(err) => {
-                debug!("receive substream error: {:?}", err);
-                return Err(io::ErrorKind::Other.into());
-            },
-        }
-
-        // TODO: should optmize later
-        let addrs = self.substreams
-            .keys()
-            .filter(|key| {
-                // FIXME: filter out with known address list
-                true
-            })
-            .map(|key| AddrRaw::from(key.remote_addr))
-            .collect::<Vec<_>>();
-
-        let mut announce_addrs = Vec::new();
-        for (key, value) in self.substreams.iter_mut() {
-            if let Err(err) = value.check_timer(&addrs) {
-                debug!("substream {:?} poll timer_future error: {:?}", key, err);
-                self.err_keys.insert(key.clone());
-            }
-
-            match value.receive_messages(&mut self.addr_mgr) {
-                Ok(Some(nodes_list)) => {
-                    for nodes in nodes_list {
-                        self.pending_nodes.push_back((key.clone(), nodes));
-                    }
-                },
-                Ok(None) => {
-                    // TODO: EOF => remote closed the connection
-                }
-                Err(err) => {
-                    debug!("substream {:?} receive messages error: {:?}", key, err);
-                    // remove the substream
-                    self.err_keys.insert(key.clone());
-                }
-            }
-
-            match value.send_messages() {
-                Ok(_) => {},
-                Err(err) => {
-                    debug!("substream {:?} send messages error: {:?}", key, err);
-                    // remove the substream
-                    self.err_keys.insert(key.clone());
-                }
-            }
-
-            if value.announce {
-                announce_addrs.push(value.remote_addr);
-            }
-        }
-
-        for key in self.err_keys.drain() {
-            self.substreams.remove(&key);
-        }
-
-        let mut rng = rand::thread_rng();
-        let mut remain_keys = self.substreams.keys().cloned().collect::<Vec<_>>();
-        for announce_addr in announce_addrs.into_iter() {
-            remain_keys.shuffle(&mut rng);
-            for i in 0..2 {
-                if let Some(key) = remain_keys.get(i) {
-                    if let Some(value) = self.substreams.get_mut(key) {
-                        if value.announce_addrs.len() < 10 {
-                            value.announce_addrs.push(announce_addr);
-                        }
-                    }
-                }
-            }
-        }
-
-        for (key, value) in self.substreams.iter_mut() {
-            let announce_addrs = value.announce_addrs.split_off(0);
-            if !announce_addrs.is_empty() {
-                let items = announce_addrs
-                    .into_iter()
-                    .map(|addr| {
-                        Node { node_id: None, addresses: vec![AddrRaw::from(addr)] }
-                    })
-                    .collect::<Vec<_>>();
-                let nodes = Nodes { announce: false, items };
-                value.pending_messages.push_back(DiscoveryMessage::Nodes(nodes));
-            }
-
-            match value.send_messages() {
-                Ok(_) => {},
-                Err(err) => {
-                    debug!("substream {:?} send messages error: {:?}", key, err);
-                    // remove the substream
-                    self.err_keys.insert(key.clone());
-                }
-            }
-        }
-
-        match self.pending_nodes.pop_front() {
-            Some((_key, nodes)) => Ok(Async::Ready(Some(nodes))),
-            None => Ok(Async::NotReady)
-        }
-    }
-}
-
 #[derive(Eq, PartialEq, Hash, Debug, Clone)]
 pub struct SubstreamKey {
     remote_addr: SocketAddr,
@@ -396,7 +396,6 @@ pub struct SubstreamValue {
     timer_future: Interval,
     received_get_nodes: bool,
     received_nodes: bool,
-    received_first_announce_nodes: bool,
     remote_closed: bool,
 }
 
@@ -424,7 +423,6 @@ impl SubstreamValue {
             announce_addrs: Vec::new(),
             received_get_nodes: false,
             received_nodes: false,
-            received_first_announce_nodes: false,
             remote_closed: false,
         }
     }
@@ -436,7 +434,7 @@ impl SubstreamValue {
                 self.announce = true;
             }
             Async::Ready(None) => unreachable!(),
-            Async::NotReady => {},
+            Async::NotReady => {}
         }
         Ok(())
     }
@@ -448,7 +446,7 @@ impl SubstreamValue {
                     self.pending_messages.push_front(message);
                     return Ok(());
                 }
-                AsyncSink::Ready => {},
+                AsyncSink::Ready => {}
             }
         }
         self.framed_stream.poll_complete()?;
@@ -464,7 +462,7 @@ impl SubstreamValue {
             DiscoveryMessage::GetNodes { version, count } => {
                 if self.received_get_nodes {
                     // TODO: misbehavior
-                    addr_mgr.misbehave(self.remote_addr);
+                    addr_mgr.misbehave(self.remote_addr, 111);
                 } else {
                     // TODO: magic number
                     let mut items = addr_mgr.get_random(2500);
@@ -476,33 +474,35 @@ impl SubstreamValue {
                     }
                     let items = items
                         .into_iter()
-                        .map(|addr| {
-                            Node { node_id: None, addresses: vec![AddrRaw::from(addr)] }
+                        .map(|addr| Node {
+                            node_id: None,
+                            addresses: vec![AddrRaw::from(addr)],
                         })
                         .collect::<Vec<_>>();
-                    let nodes = Nodes { announce: false, items };
-                    self.pending_messages.push_back(DiscoveryMessage::Nodes(nodes));
+                    let nodes = Nodes {
+                        announce: false,
+                        items,
+                    };
+                    self.pending_messages
+                        .push_back(DiscoveryMessage::Nodes(nodes));
                     self.received_get_nodes = true;
                 }
             }
             DiscoveryMessage::Nodes(nodes) => {
                 if nodes.announce {
-                    if self.received_first_announce_nodes && nodes.items.len() > ANNOUNCE_THRESHOLD {
+                    if nodes.items.len() > ANNOUNCE_THRESHOLD {
                         // TODO: misbehavior
-                        addr_mgr.misbehave(self.remote_addr);
-                    } else  {
-                        if !self.received_first_announce_nodes {
-                            self.received_first_announce_nodes = true;
-                        }
+                        addr_mgr.misbehave(self.remote_addr, 222);
+                    } else {
                         return Ok(Some(nodes));
                     }
                 } else {
                     if self.received_nodes {
                         // TODO: misbehavior
-                        addr_mgr.misbehave(self.remote_addr);
+                        addr_mgr.misbehave(self.remote_addr, 333);
                     } else if nodes.items.len() > MAX_ADDR_TO_SEND {
                         // TODO: misbehavior
-                        addr_mgr.misbehave(self.remote_addr);
+                        addr_mgr.misbehave(self.remote_addr, 444);
                     } else {
                         self.received_nodes = true;
                         return Ok(Some(nodes));
@@ -513,7 +513,10 @@ impl SubstreamValue {
         Ok(None)
     }
 
-    fn receive_messages<M: AddressManager>(&mut self, addr_mgr: &mut M) -> Result<Option<Vec<Nodes>>, io::Error> {
+    fn receive_messages<M: AddressManager>(
+        &mut self,
+        addr_mgr: &mut M,
+    ) -> Result<Option<Vec<Nodes>>, io::Error> {
         if self.remote_closed {
             return Ok(None);
         }
@@ -531,15 +534,15 @@ impl SubstreamValue {
                         }
                         nodes_list.push(nodes);
                     }
-                },
+                }
                 Async::Ready(None) => {
                     debug!("remote closed");
                     self.remote_closed = true;
                     break;
-                },
+                }
                 Async::NotReady => {
                     break;
-                },
+                }
             }
         }
         Ok(Some(nodes_list))
@@ -593,10 +596,7 @@ pub enum Direction {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum DiscoveryMessage {
-    GetNodes {
-        version: u32,
-        count: u32,
-    },
+    GetNodes { version: u32, count: u32 },
     Nodes(Nodes),
 }
 
