@@ -24,11 +24,14 @@ mod addr;
 mod message;
 mod substream;
 
-use crate::{
+pub use crate::{
     addr::{AddrKnown, AddrRaw, AddressManager, DemoAddressManager},
-    message::{DiscoveryCodec, DiscoveryMessage, Nodes, Node},
+    message::{DiscoveryMessage, Nodes, Node},
     substream::{SubstreamKey, SubstreamValue, Substream},
 };
+
+use crate::message::{DiscoveryCodec};
+use crate::addr::{DEFAULT_MAX_KNOWN};
 
 pub struct Discovery<M> {
     // Default: 5000
@@ -56,10 +59,10 @@ pub struct DiscoveryHandle {
 }
 
 impl<M: AddressManager> Discovery<M> {
-    pub fn new(max_known: usize, addr_mgr: M) -> Discovery<M> {
+    pub fn new(addr_mgr: M) -> Discovery<M> {
         let (substream_sender, substream_receiver) = channel(8);
         Discovery {
-            max_known,
+            max_known: DEFAULT_MAX_KNOWN,
             addr_mgr,
             pending_nodes: VecDeque::default(),
             substreams: FnvHashMap::default(),

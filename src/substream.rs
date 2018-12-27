@@ -115,7 +115,10 @@ impl SubstreamValue {
             DiscoveryMessage::GetNodes { version, count } => {
                 if self.received_get_nodes {
                     // TODO: misbehavior
-                    addr_mgr.misbehave(self.remote_addr, 111);
+                    if addr_mgr.misbehave(self.remote_addr, 111) < 0 {
+                        // TODO: more clear error type
+                        return Err(io::ErrorKind::Other.into())
+                    }
                 } else {
                     // TODO: magic number
                     let mut items = addr_mgr.get_random(2500);
@@ -145,17 +148,26 @@ impl SubstreamValue {
                 if nodes.announce {
                     if nodes.items.len() > ANNOUNCE_THRESHOLD {
                         // TODO: misbehavior
-                        addr_mgr.misbehave(self.remote_addr, 222);
+                        if addr_mgr.misbehave(self.remote_addr, 222) < 0 {
+                            // TODO: more clear error type
+                            return Err(io::ErrorKind::Other.into())
+                        }
                     } else {
                         return Ok(Some(nodes));
                     }
                 } else {
                     if self.received_nodes {
                         // TODO: misbehavior
-                        addr_mgr.misbehave(self.remote_addr, 333);
+                        if addr_mgr.misbehave(self.remote_addr, 333) < 0 {
+                            // TODO: more clear error type
+                            return Err(io::ErrorKind::Other.into())
+                        }
                     } else if nodes.items.len() > MAX_ADDR_TO_SEND {
                         // TODO: misbehavior
-                        addr_mgr.misbehave(self.remote_addr, 444);
+                        if addr_mgr.misbehave(self.remote_addr, 444) < 0 {
+                            // TODO: more clear error type
+                            return Err(io::ErrorKind::Other.into())
+                        }
                     } else {
                         self.received_nodes = true;
                         return Ok(Some(nodes));

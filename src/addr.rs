@@ -23,20 +23,37 @@ pub(crate) const DEFAULT_MAX_KNOWN: usize = 5000;
 
 // FIXME: Should be peer store?
 pub trait AddressManager {
-    fn add_new(&mut self, addr: SocketAddr);
-    fn misbehave(&mut self, addr: SocketAddr, ty: u64);
+    fn misbehave(&mut self, addr: SocketAddr, ty: u64) -> i32;
     fn get_random(&mut self, n: usize) -> Vec<SocketAddr>;
 }
 
-pub struct DemoAddressManager {}
+#[derive(Default)]
+pub struct DemoAddressManager {
+    pub addrs: FnvHashMap<AddrRaw, i32>,
+}
+
+impl DemoAddressManager {
+    fn add_new(&mut self, addr: SocketAddr) {
+        self.addrs.entry(AddrRaw::from(addr)).or_insert(100);
+    }
+}
 
 impl AddressManager for DemoAddressManager {
-    fn add_new(&mut self, addr: SocketAddr) {}
 
-    fn misbehave(&mut self, addr: SocketAddr, ty: u64) {}
+    fn misbehave(&mut self, addr: SocketAddr, ty: u64) -> i32 {
+        let value = self.addrs
+            .entry(AddrRaw::from(addr))
+            .or_insert(100);
+        *value -= 20;
+        *value
+    }
 
     fn get_random(&mut self, n: usize) -> Vec<SocketAddr> {
-        Vec::new()
+        self.addrs
+            .keys()
+            .take(n)
+            .map(|addr| addr.socket_addr())
+            .collect()
     }
 }
 

@@ -12,7 +12,11 @@ use tokio::codec::{Decoder, Encoder, Framed};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::timer::{self, Interval};
 
-use discovery::{Discovery, DiscoveryHandle};
+use discovery::{
+    Discovery,
+    DiscoveryHandle,
+    DemoAddressManager,
+};
 
 fn main() {
     println!("Starting ......");
@@ -20,7 +24,8 @@ fn main() {
 }
 
 fn start_discovery() {
-    let discovery = Discovery::default();
+    let addr_mgr = DemoAddressManager::default();
+    let discovery = Discovery::new(addr_mgr);
     let handle = discovery.handle();
     let fut = discovery
         .map_err(|err| {
