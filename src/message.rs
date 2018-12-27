@@ -1,8 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use log::debug;

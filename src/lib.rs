@@ -1,24 +1,13 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{VecDeque};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 
-use bincode::{deserialize, serialize};
-use bytes::{BufMut, Bytes, BytesMut};
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::{
     sync::mpsc::{channel, Receiver, Sender},
     try_ready, Async, AsyncSink, Poll, Sink, Stream,
 };
 use log::debug;
-use multiaddr::Multiaddr;
 use rand::seq::SliceRandom;
-use serde_derive::{Deserialize, Serialize};
-use tokio::codec::{Decoder, Encoder, Framed};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::timer::{self, Interval};
-use yamux::{config::Config, session::Session, stream::StreamHandle};
 
 mod addr;
 mod message;
@@ -30,7 +19,6 @@ pub use crate::{
     substream::{SubstreamKey, SubstreamValue, Substream},
 };
 
-use crate::message::{DiscoveryCodec};
 use crate::addr::{DEFAULT_MAX_KNOWN};
 
 pub struct Discovery<M> {
@@ -87,7 +75,7 @@ impl<M: AddressManager> Discovery<M> {
 }
 
 impl<M: AddressManager> Stream for Discovery<M> {
-    type Item = Nodes;
+    type Item = ();
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -198,7 +186,14 @@ impl<M: AddressManager> Stream for Discovery<M> {
         }
 
         match self.pending_nodes.pop_front() {
-            Some((_key, nodes)) => Ok(Async::Ready(Some(nodes))),
+            Some((_key, nodes)) => {
+                for node in nodes.items.into_iter() {
+                    for addr in node.addresses.into_iter() {
+                        self.addr_mgr.add_new(addr.socket_addr());
+                    }
+                }
+                Ok(Async::Ready(Some(())))
+            },
             None => Ok(Async::NotReady),
         }
     }

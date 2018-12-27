@@ -1,27 +1,19 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 
-use bincode::{deserialize, serialize};
-use bytes::{BufMut, Bytes, BytesMut};
-use fnv::{FnvHashMap, FnvHashSet};
 use futures::{
-    sync::mpsc::{channel, Receiver, Sender},
     try_ready, Async, AsyncSink, Poll, Sink, Stream,
 };
 use log::debug;
-use multiaddr::Multiaddr;
-use rand::seq::SliceRandom;
-use serde_derive::{Deserialize, Serialize};
-use tokio::codec::{Decoder, Encoder, Framed};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::codec::{Framed};
 use tokio::timer::{self, Interval};
-use yamux::{config::Config, session::Session, stream::StreamHandle};
+use yamux::{stream::StreamHandle};
 
 use crate::message::{DiscoveryCodec, DiscoveryMessage, Nodes, Node};
 use crate::addr::{AddrKnown, AddrRaw, AddressManager};
+
 
 // FIXME: should be a more high level version number
 const VERSION: u32 = 0;

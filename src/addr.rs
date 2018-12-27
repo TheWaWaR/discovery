@@ -23,6 +23,7 @@ pub(crate) const DEFAULT_MAX_KNOWN: usize = 5000;
 
 // FIXME: Should be peer store?
 pub trait AddressManager {
+    fn add_new(&mut self, addr: SocketAddr);
     fn misbehave(&mut self, addr: SocketAddr, ty: u64) -> i32;
     fn get_random(&mut self, n: usize) -> Vec<SocketAddr>;
 }
@@ -33,12 +34,12 @@ pub struct DemoAddressManager {
 }
 
 impl DemoAddressManager {
-    fn add_new(&mut self, addr: SocketAddr) {
-        self.addrs.entry(AddrRaw::from(addr)).or_insert(100);
-    }
 }
 
 impl AddressManager for DemoAddressManager {
+    fn add_new(&mut self, addr: SocketAddr) {
+        self.addrs.entry(AddrRaw::from(addr)).or_insert(100);
+    }
 
     fn misbehave(&mut self, addr: SocketAddr, ty: u64) -> i32 {
         let value = self.addrs
